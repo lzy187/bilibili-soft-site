@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站全站柔和显示 - OLED 深色模式文字与图片亮度调节
 // @namespace    local.bilibili.soft-comments
-// @version      2.1.0
+// @version      2.2.0
 // @description  配合哔哩哔哩 bilibili 深色模式，调暗标题、评论、推荐列表等亮白文字和常见图标；独立调整表情、封面、头像亮度，保留视频画面，适合 OLED 屏幕。
 // @homepageURL  https://github.com/lzy187/bilibili-soft-site
 // @supportURL   https://github.com/lzy187/bilibili-soft-site/issues
@@ -38,18 +38,38 @@
   const processed = new WeakSet();
   const ownStyles = new WeakMap();
   const observers = new Map();
-  const dirty = new Set();
-  let dirtyScheduled = false;
-  let forceScan = false;
+  const dirty = new Map();
+  let activeJob = null;
+  let workTimer = null;
+  let discoveryTimer = null;
+  // 播放器的弹幕、字幕、控制栏、进度和鼠标隐藏状态都由网站管理。
+  const playerSelector = '#bilibili-player, .bpx-player-container, .bilibili-player, '
+    + '#live-player, #live-player-ctnr, .bili-danmaku-x-dm, .b-danmaku';
   const skip = new Set(['script', 'style', 'link', 'meta', 'noscript', 'template',
     'video', 'audio', 'canvas', 'iframe', 'source', 'track']);
   const shapes = new Set(['svg', 'g', 'path', 'use', 'rect', 'circle', 'ellipse',
     'line', 'polygon', 'polyline', 'text']);
   let css = '';
-  let queue = [];
-  let position = 0;
-  let timer;
   let ceiling = 180;
+
+  function excluded(element) {
+    // closest不会跨Shadow Root，逐层检查宿主，连播放器内的自定义组件也排除。
+    for (let node = element; node; node = node.getRootNode().host) {
+      if (node.closest(playerSelector)) return true;
+    }
+    return false;
+  }
+
+  function styleSignature(element) {
+    // 位置、transform、光标、宽高等动画属性与本脚本无关。
+    const style = element.style;
+    if (!style) return '';
+    const properties = ['color', 'fill', 'stroke', 'filter', '-webkit-text-fill-color'];
+    for (const name of style) {
+      if (name.startsWith('--') && name !== '--bs2-original-filter') properties.push(name);
+    }
+    return properties.map(name => `${name}:${style.getPropertyValue(name)}!${style.getPropertyPriority(name)}`).join(';');
+  }
 
   function makeCSS() {
     ceiling = Math.max(...color.slice(1).match(/../g).map(v => parseInt(v, 16)));
@@ -87,17 +107,20 @@
 
   // 只监听网站会修改的属性；不监听本脚本自己的data标记。
   function observeRoot(root) {
-    if (observers.has(root)) return;
+    if (!enabled || document.hidden || observers.has(root)) return;
     const observer = new MutationObserver(records => {
+      if (!enabled || document.hidden) return;
+      const seen = new Set();
       for (const record of records) {
-        const target = record.target;
-        if (target.nodeType === 1 && target.matches('style[data-bs2-sheet]')) continue;
+        const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+        if (!target || excluded(target) || skip.has(target.localName)) continue;
         if (record.type === 'attributes') {
-          if (record.attributeName === 'style' && ownStyles.has(target)
-            && ownStyles.get(target) === target.getAttribute('style')) continue;
+          if (seen.has(target)) continue;
+          if (record.attributeName === 'style' && ownStyles.get(target) === styleSignature(target)) continue;
+          seen.add(target);
           markDirty(target);
         } else if (record.type === 'characterData') {
-          markDirty(target.parentElement);
+          markDirty(target);
         } else {
           for (const node of record.addedNodes) {
             if (node.nodeType === 1 && !node.matches('style[data-bs2-sheet]')) markDirty(node);
@@ -114,31 +137,66 @@
     observers.set(root, observer);
   }
 
-  function markDirty(element) {
-    if (!element || element.nodeType !== 1 || skip.has(element.localName)) return;
-    dirty.add(element);
-    if (dirtyScheduled) return;
-    dirtyScheduled = true;
-    queueMicrotask(() => {
-      dirtyScheduled = false;
-      const pending = [...dirty]; dirty.clear();
-      for (const node of pending) {
-        if (!node.isConnected) continue;
-        // 父节点已在本批内时，不重复遍历它的子树。
-        if (pending.some(parent => parent !== node && parent.contains(node))) continue;
-        refreshTree(node);
-      }
-    });
+  function markDirty(element, force = true) {
+    if (!enabled || document.hidden || !element || element.nodeType !== 1
+      || skip.has(element.localName) || excluded(element)) return;
+    // 只沿祖先链去重，不再对同批节点做两两contains比较。
+    for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
+      if (dirty.has(parent) && (dirty.get(parent) || !force)) return;
+    }
+    dirty.set(element, force || dirty.get(element) || false);
+    // 限制突发更新积压，合并为一次可分片的全页遍历。
+    if (dirty.size > 128) {
+      dirty.clear();
+      dirty.set(document.documentElement, true);
+    }
+    if (workTimer === null) workTimer = setTimeout(drain, 16);
   }
 
-  function refreshTree(element) {
+  function* walkElements(element) {
+    // 链式遍历，不提前querySelectorAll全页；播放器子树在入口直接剪枝。
+    const stack = [{element, siblings: false}];
     ensureSheet(element.getRootNode());
-    processElement(element, true);
-    if (element.shadowRoot) {
-      ensureSheet(element.shadowRoot);
-      for (const child of element.shadowRoot.children) refreshTree(child);
+    while (stack.length) {
+      const entry = stack.pop();
+      const node = entry.element;
+      if (entry.siblings && node.nextElementSibling) stack.push({element: node.nextElementSibling, siblings: true});
+      if (!node.isConnected || skip.has(node.localName) || excluded(node)) continue;
+      if (node.firstElementChild) stack.push({element: node.firstElementChild, siblings: true});
+      if (node.shadowRoot) {
+        ensureSheet(node.shadowRoot);
+        if (node.shadowRoot.firstElementChild) stack.push({element: node.shadowRoot.firstElementChild, siblings: true});
+      }
+      yield node;
     }
-    for (const child of element.children) refreshTree(child);
+  }
+
+  function drain() {
+    workTimer = null;
+    if (!enabled || document.hidden) return;
+    const deadline = performance.now() + 5;
+    let count = 0;
+    do {
+      if (!activeJob) {
+        const next = dirty.entries().next();
+        if (next.done) break;
+        const [element, force] = next.value;
+        dirty.delete(element);
+        activeJob = {iterator: walkElements(element), force};
+      }
+      const next = activeJob.iterator.next();
+      if (next.done) activeJob = null;
+      else { processElement(next.value, activeJob.force); count++; }
+    } while (count < 80 && performance.now() < deadline);
+    if (activeJob || dirty.size) workTimer = setTimeout(drain, 16);
+  }
+
+  function stopWork() {
+    clearTimeout(workTimer); workTimer = null;
+    clearTimeout(discoveryTimer); discoveryTimer = null;
+    dirty.clear(); activeJob = null;
+    for (const observer of observers.values()) observer.disconnect();
+    observers.clear();
   }
 
   // 只选择明亮且接近中性的颜色。保留深灰字、蓝色链接和其他饱和色。
@@ -175,11 +233,12 @@
   }
 
   function processElement(element, force = false) {
-    if (!element.isConnected || skip.has(element.localName)) return;
+    if (!element.isConnected || skip.has(element.localName) || excluded(element)) return;
     if (element.closest('defs, mask, clipPath, filter')) return;
     // 周期巡检只发现新节点，不再周期性撤销已经生效的颜色。
     if (!force && processed.has(element)) return;
     processed.add(element);
+    ownStyles.set(element, styleSignature(element));
     const isImage = element.localName === 'img';
     const isShape = shapes.has(element.localName);
     const hasText = [...element.childNodes].some(n => n.nodeType === 3 && n.textContent.trim());
@@ -235,38 +294,19 @@
       if (transitionValue) element.style.setProperty('transition-property', transitionValue, transitionPriority);
       else element.style.removeProperty('transition-property');
       element.removeAttribute('data-bs2-measuring');
-      ownStyles.set(element, element.getAttribute('style'));
-    }
-  }
-
-  function collect(root) {
-    ensureSheet(root);
-    for (const element of root.querySelectorAll('*')) {
-      if (!skip.has(element.localName)) queue.push(element);
-      if (element.shadowRoot) collect(element.shadowRoot);
+      ownStyles.set(element, styleSignature(element));
     }
   }
 
   function startScan(force = false) {
-    clearTimeout(timer);
-    queue = [];
-    position = 0;
-    forceScan = force;
+    clearTimeout(discoveryTimer);
+    if (!enabled || document.hidden) return;
     for (const [root] of sheets) if (root !== document && !root.host.isConnected) {
       sheets.delete(root); observers.get(root)?.disconnect(); observers.delete(root);
     }
-    if (document.hidden) { timer = setTimeout(startScan, 3000); return; }
-    collect(document);
-    step();
-  }
-
-  function step() {
-    if (document.hidden) { queue = []; timer = setTimeout(startScan, 3000); return; }
-    // 分批处理，避免长评论页一次性占满主线程。
-    const end = Math.min(position + 100, queue.length);
-    while (position < end) processElement(queue[position++], forceScan);
-    if (position < queue.length) timer = setTimeout(step, 16);
-    else { queue = []; timer = setTimeout(startScan, 3000); }
+    markDirty(document.documentElement, force);
+    // 仅兜底发现延迟attachShadow的组件，已处理节点不重复测色。
+    discoveryTimer = setTimeout(startScan, 15000);
   }
 
   function update() {
@@ -274,6 +314,7 @@
     GM_setValue('enabled', enabled);
     GM_setValue('emojiBrightness', emojiBrightness);
     GM_setValue('imageBrightness', imageBrightness);
+    stopWork();
     makeCSS();
     for (const root of sheets.keys()) ensureSheet(root);
     startScan(true);
@@ -306,5 +347,8 @@
   });
   makeCSS();
   startScan();
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) startScan(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stopWork();
+    else startScan(true);
+  });
 })();
